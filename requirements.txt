@@ -1,0 +1,7 @@
+plotly
+sqlalchemy
+xgboost
+catboost
+scikit-learn
+holidays
+scipy
