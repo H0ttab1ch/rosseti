@@ -161,7 +161,7 @@ def load_and_preprocess_energy_data():
 @st.cache_data(ttl=600)
 def load_power_setpoints():
     """Загрузка таблицы уставок мощности и параметров объектов."""
-    db_url = st.secrets.get("DB_URL") or os.getenv("DATABASE_URL")
+    db_url = os.getenv("DATABASE_URL")
     if not db_url:
         return pd.DataFrame()
 
