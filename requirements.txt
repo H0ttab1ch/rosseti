@@ -5,4 +5,4 @@ catboost
 scikit-learn
 holidays
 scipy
-psycopg2
+psycopg2-binary
