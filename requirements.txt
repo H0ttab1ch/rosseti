@@ -6,3 +6,4 @@ scikit-learn
 holidays
 scipy
 psycopg2-binary
+streamlit
