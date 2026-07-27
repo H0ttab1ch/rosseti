@@ -106,7 +106,7 @@ st.markdown(ROSSETI_CSS, unsafe_allow_html=True)
 # ---------------------------------------------------------
 @st.cache_data(ttl=600)
 def load_and_preprocess_energy_data():
-    db_url = st.secrets.get("DB_URL") or os.getenv("DATABASE_URL")
+    db_url = st.secrets.get("DB_URL") or os.getenv("DB_URL")
     if not db_url:
         st.error("Строка подключения к БД отсутствует. Настройте DB_URL.")
         st.stop()
