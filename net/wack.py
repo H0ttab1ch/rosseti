@@ -104,7 +104,8 @@ st.markdown(ROSSETI_CSS, unsafe_allow_html=True)
 # ---------------------------------------------------------
 # 1. ЗАГРУЗКА ДАННЫХ ИЗ ТРЁХ ТАБЛИЦ ИСТОЧНИКОВ
 # ---------------------------------------------------------
-@st.cache_data(ttl=600)
+# Здесь оставляем ttl=600, чтобы БД опрашивалась раз в 10 минут при поступлении новых данных.
+@st.cache_data(ttl=600, show_spinner=False)
 def load_and_preprocess_energy_data():
     db_url = os.getenv("DB_URL")
     if not db_url:
@@ -113,20 +114,17 @@ def load_and_preprocess_energy_data():
 
     engine = create_engine(db_url)
     
-    # Загрузка данных power_ext (3 целевых объекта АЗС)
     query_ext = "SELECT * FROM power_ext ORDER BY station_id, date ASC;"
     df_ext = pd.read_sql(query_ext, engine)
     
     excluded_consumers = tuple(df_ext['station_id'].unique().tolist()) if not df_ext.empty else ()
     
-    # Формируем WHERE, чтобы исключить объекты из power_ext
     if excluded_consumers:
         excl_str = f"('{excluded_consumers[0]}')" if len(excluded_consumers) == 1 else str(excluded_consumers)
         where_clause = f"WHERE source_sheet NOT IN {excl_str}"
     else:
         where_clause = ""
 
-    # Загрузка основной таблицы power
     query_power = f"""
     SELECT 
         source_sheet AS series_name,
@@ -139,7 +137,6 @@ def load_and_preprocess_energy_data():
     """
     df_power = pd.read_sql(query_power, engine)
 
-    # Базовая подготовка power
     if not df_power.empty:
         df_power['ts'] = pd.to_datetime(df_power['ts'])
         df_power['series_name'] = df_power['series_name'].astype(str)
@@ -151,16 +148,14 @@ def load_and_preprocess_energy_data():
             .reset_index()
         ).sort_values(by=['series_name', 'ts']).reset_index(drop=True)
 
-    # Базовая подготовка power_ext
     if not df_ext.empty:
         df_ext['date'] = pd.to_datetime(df_ext['date'])
 
     return df_power, df_ext
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_power_setpoints():
-    """Загрузка таблицы уставок мощности и параметров объектов."""
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         return pd.DataFrame()
@@ -178,6 +173,7 @@ def load_power_setpoints():
 # ---------------------------------------------------------
 # 2. МОДЕЛЬ 1: XGBoost ДЛЯ ОСНОВНЫХ ОБЪЕКТОВ
 # ---------------------------------------------------------
+@st.cache_data(show_spinner=False)
 def preprocess_daily_advanced(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
         
@@ -209,7 +205,8 @@ def preprocess_daily_advanced(df: pd.DataFrame) -> pd.DataFrame:
     df['ratio_7d_30d'] = (df['rolling_mean_7d'] / (df['rolling_mean_30d'] + 1e-5)).fillna(1.0)
     return df
 
-@st.cache_data(ttl=600)
+# Убран параметр ttl. Модель обучится 1 раз, и результат закешируется навсегда (до изменения входного df)
+@st.cache_data(show_spinner=False)
 def walk_forward_global_model(df: pd.DataFrame, retrain_step_days: int = 7) -> pd.DataFrame:
     if df.empty: return df
 
@@ -267,21 +264,20 @@ def walk_forward_global_model(df: pd.DataFrame, retrain_step_days: int = 7) -> p
 # ---------------------------------------------------------
 # 3. МОДЕЛЬ 2: CatBoost ДЛЯ ТРЁХ ОБЪЕКТОВ ИЗ power_ext
 # ---------------------------------------------------------
-@st.cache_data(ttl=600)
+# Убран параметр ttl. Модель обучится 1 раз.
+@st.cache_data(show_spinner=False)
 def process_catboost_model(df_ext: pd.DataFrame) -> pd.DataFrame:
     if df_ext.empty:
         return pd.DataFrame()
         
     df = df_ext.copy()
     
-    # Сопоставление структуры
     df.rename(columns={
         'station_id': 'series_name', 
         'date': 'ts', 
         'power_consumption': 'real_kwh'
     }, inplace=True)
     
-    # Циклические признаки для CatBoost
     df['month'] = df['ts'].dt.month
     df['day_of_year'] = df['ts'].dt.dayofyear
     df['month_sin'] = np.sin(2*np.pi*df['month']/12)
@@ -289,7 +285,6 @@ def process_catboost_model(df_ext: pd.DataFrame) -> pd.DataFrame:
     df['day_of_year_sin'] = np.sin(2*np.pi*df['day_of_year']/365)
     df['day_of_year_cos'] = np.cos(2*np.pi*df['day_of_year']/365)
 
-    # Признаки из таблицы power_ext
     feature_cols = [
         'series_name', 'day_of_week', 'month',
         'is_weekend', 'is_holiday', 'is_pre_holiday',
@@ -301,7 +296,6 @@ def process_catboost_model(df_ext: pd.DataFrame) -> pd.DataFrame:
     X = df[feature_cols].reset_index(drop=True)
     y = df['real_kwh'].reset_index(drop=True)
 
-    # Кросс-валидация со стратификацией по объекту
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     oof_preds = np.zeros(len(y))
 
@@ -309,7 +303,6 @@ def process_catboost_model(df_ext: pd.DataFrame) -> pd.DataFrame:
         train_pool = Pool(X.iloc[train_idx], y.iloc[train_idx], cat_features=cat_features)
         test_pool = Pool(X.iloc[test_idx], cat_features=cat_features)
 
-        # Для внутренней метрики CatBoost используется встроенное название 'MAE'
         model = CatBoostRegressor(iterations=300, learning_rate=0.05, depth=4,
                                    loss_function='MAE', verbose=0, random_seed=42)
         model.fit(train_pool)
@@ -357,6 +350,13 @@ def anomaly_tester(df: pd.DataFrame, std_threshold: float = 2.75):
 
     return df, metrics
 
+# --- Callbacks для кнопок, чтобы избежать ручных st.rerun() ---
+def navigate_to_page(page_name):
+    st.session_state.navigation_page = page_name
+
+def navigate_to_chart_from_map():
+    st.session_state.selected_consumer_target = st.session_state.map_target_select
+    st.session_state.navigation_page = "Графики объектов"
 
 def main():
     st.markdown("""
@@ -366,26 +366,20 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    with st.spinner("Загрузка данных и инициализация моделей (XGBoost + CatBoost)..."):
-        # Извлекаем данные
+    with st.spinner("Синхронизация данных и расчет моделей..."):
         df_power, df_ext = load_and_preprocess_energy_data()
         df_setpoints = load_power_setpoints()
         
-        # Запуск пайплайна XGBoost
         df_processed_xgb = preprocess_daily_advanced(df_power)
         df_final_xgb = walk_forward_global_model(df_processed_xgb, retrain_step_days=7)
-        
-        # Запуск пайплайна CatBoost
         df_final_cat = process_catboost_model(df_ext)
         
-        # Слияние потоков предсказаний
         df_final = pd.concat([df_final_xgb, df_final_cat], ignore_index=True)
 
     if df_final.empty:
         st.warning("Данные не получены из базы данных.")
         st.stop()
 
-        # --- Настройки панели управления (Sidebar) ---
     confidence_pct = st.sidebar.slider(
         "Порог норматива (%)", 
         min_value=80.0, 
@@ -395,18 +389,23 @@ def main():
         help="Доля ожидаемого штатного электропотребления. Все значения за пределами этого интервала считаются аномалиями."
     )
 
-    # 2. Convert confidence percentage to sigma threshold (z-score)
     alpha = 1.0 - (confidence_pct / 100.0)
     std_thresh = float(norm.ppf(1.0 - alpha / 2.0))
-
-    # Optional display showing the calculated sigma for transparency
     st.sidebar.caption(f"Эквивалент в стандартных отклонениях: **±{std_thresh:.2f}σ**")
-
 
     df_evaluated, metrics = anomaly_tester(df_final, std_threshold=std_thresh)
     all_consumers = sorted(df_final['series_name'].unique().tolist())
 
-    # Динамическая привязка координат из power_setpoints при наличии
+    # --- Инициализация состояния ---
+    pages_list = ["Интерактивная карта", "Общая сводка", "Графики объектов"]
+    
+    if "navigation_page" not in st.session_state:
+        st.session_state.navigation_page = pages_list[0]
+    
+    if "selected_consumer_target" not in st.session_state:
+        st.session_state.selected_consumer_target = all_consumers[0]
+
+    # Координаты объектов
     default_coords = {
         "02073": {"lat": 54.7621750, "lon": 56.3952460},
         "02136": {"lat": 54.6225180, "lon": 55.9280060},
@@ -423,7 +422,6 @@ def main():
             matched = False
             c_lower = c.lower()
             
-            # Пробуем найти координаты в загруженной power_setpoints
             if not df_setpoints.empty:
                 match_sp = df_setpoints[df_setpoints['location'].astype(str).str.strip().str.lower().apply(lambda loc: loc in c_lower or c_lower in loc)]
                 if not match_sp.empty:
@@ -440,20 +438,16 @@ def main():
             if not matched:
                 st.session_state.consumer_coords[c] = {"lat": 54.75, "lon": 56.0}
 
-    pages_list = ["Интерактивная карта", "Общая сводка", "Графики объектов"]
-    if 'navigation_page' not in st.session_state or st.session_state.navigation_page not in pages_list:
-        st.session_state.navigation_page = "Интерактивная карта"
-    if 'selected_consumer_target' not in st.session_state:
-        st.session_state.selected_consumer_target = all_consumers[0]
-
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Разделы дашборда")
-    selected_page = st.sidebar.radio(
-        "Навигация", options=pages_list, index=pages_list.index(st.session_state.navigation_page), label_visibility="collapsed"
+    
+    # Прямая привязка radio-кнопки к st.session_state.navigation_page через ключ (key)
+    st.sidebar.radio(
+        "Навигация", 
+        options=pages_list, 
+        key="navigation_page", 
+        label_visibility="collapsed"
     )
-    if selected_page != st.session_state.navigation_page:
-        st.session_state.navigation_page = selected_page
-        st.rerun()
 
     # --- СТРАНИЦА 1: КАРТА ---
     if st.session_state.navigation_page == "Интерактивная карта":
@@ -477,30 +471,31 @@ def main():
             legend=dict(title=dict(text="Статус объекта", font=dict(color="#1A1A1A")), bgcolor="rgba(255, 255, 255, 0.95)", bordercolor="#E0E0E0", borderwidth=1, font=dict(color="#1A1A1A"), yanchor="top", y=0.98, xanchor="left", x=0.01)
         )
         fig_map.update_traces(marker=dict(size=22))
+        
         map_event = st.plotly_chart(fig_map, use_container_width=True, on_select="rerun", selection_mode="points", key="plotly_map_selection")
 
         if map_event and "selection" in map_event and "points" in map_event["selection"]:
             selected_points = map_event["selection"]["points"]
             if selected_points and selected_points[0].get("customdata"):
-                st.session_state.selected_consumer_target = selected_points[0].get("customdata")[0]
-                st.session_state.navigation_page = "Графики объектов"
-                st.rerun()
+                new_target = selected_points[0].get("customdata")[0]
+                # Избегаем бесконечных перезагрузок, проверяем изменилась ли цель
+                if st.session_state.selected_consumer_target != new_target or st.session_state.navigation_page != "Графики объектов":
+                    st.session_state.selected_consumer_target = new_target
+                    st.session_state.navigation_page = "Графики объектов"
+                    st.rerun()
 
         st.markdown("---")
         col_m1, col_m2 = st.columns([3, 1], vertical_alignment="bottom")
-        selected_from_map = col_m1.selectbox("Быстрый выбор объекта сети:", options=all_consumers, key="map_target_select")
-        if col_m2.button("Перейти к графику", use_container_width=True):
-            st.session_state.selected_consumer_target = selected_from_map
-            st.session_state.navigation_page = "Графики объектов"
-            st.rerun()
+        # Привязываем selectbox к промежуточному ключу
+        col_m1.selectbox("Быстрый выбор объекта сети:", options=all_consumers, key="map_target_select")
+        # Используем on_click callback
+        col_m2.button("Перейти к графику", use_container_width=True, on_click=navigate_to_chart_from_map)
 
     # --- СТРАНИЦА 2: ОБЩАЯ СВОДКА ---
     elif st.session_state.navigation_page == "Общая сводка":
         col_head, col_back = st.columns([4, 1], vertical_alignment="center")
         col_head.subheader("Сводные показатели по энергосетевому комплексу")
-        if col_back.button("К карте", use_container_width=True):
-            st.session_state.navigation_page = "Интерактивная карта"
-            st.rerun()
+        col_back.button("К карте", use_container_width=True, on_click=navigate_to_page, args=("Интерактивная карта",))
 
         valid_metrics = [m for m in metrics.values() if not pd.isna(m.get("MAPE"))]
         col1, col2, col3 = st.columns(3)
@@ -527,13 +522,14 @@ def main():
     else:
         col_head, col_back = st.columns([4, 1], vertical_alignment="center")
         col_head.subheader("Анализ профиля нагрузок объекта")
-        if col_back.button("К карте", use_container_width=True):
-            st.session_state.navigation_page = "Интерактивная карта"
-            st.rerun()
+        col_back.button("К карте", use_container_width=True, on_click=navigate_to_page, args=("Интерактивная карта",))
 
-        target_key = st.session_state.get('selected_consumer_target', None)
-        selected_consumer = st.selectbox("Выберите объект сети:", options=all_consumers, index=all_consumers.index(target_key) if target_key in all_consumers else 0)
-        st.session_state.selected_consumer_target = selected_consumer
+        # Прямая привязка selectbox к selected_consumer_target через ключ
+        selected_consumer = st.selectbox(
+            "Выберите объект сети:", 
+            options=all_consumers, 
+            key="selected_consumer_target"
+        )
 
         if selected_consumer in metrics:
             m = metrics[selected_consumer]
@@ -572,7 +568,6 @@ def main():
         st.subheader("Паспортные характеристики и уставки объекта")
 
         if not df_setpoints.empty:
-            # Сопоставляем selected_consumer с полем location из таблицы power_setpoints
             selected_lower = str(selected_consumer).strip().lower()
             matched_sp = df_setpoints[
                 df_setpoints['location'].astype(str).str.strip().str.lower().apply(
